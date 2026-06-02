@@ -13,12 +13,13 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 import litellm
 
 logger = logging.getLogger(__name__)
 DEFAULT_LLM_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_RETRIES = 2
+DEFAULT_STRUCTURED_OUTPUT_RETRIES = 1
 
 # Suppress noisy logging from litellm/openai unless error/warning
 litellm.set_verbose = False
@@ -120,6 +121,7 @@ class LLMConfig:
     send_site_info: bool = True
     timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
     num_retries: int = DEFAULT_LLM_RETRIES
+    structured_output_retries: int = DEFAULT_STRUCTURED_OUTPUT_RETRIES
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -127,6 +129,8 @@ class LLMConfig:
             raise ValueError("Model name is required")
         if self.num_retries < 0:
             raise ValueError("Number of retries cannot be negative")
+        if self.structured_output_retries < 0:
+            raise ValueError("Number of structured output retries cannot be negative")
 
 
 class LLMClient:
@@ -190,6 +194,31 @@ class LLMClient:
             value = getattr(message, key, None)
         return value if isinstance(value, str) else ""
 
+    def _completion_content(self, api_params: Dict[str, Any]) -> str:
+        """Run LiteLLM completion and return the model text content."""
+        response = litellm.completion(**api_params)
+        message = response.choices[0].message
+        content = self._get_message_value(message, "content").strip()
+        reasoning_content = self._get_message_value(
+            message, "reasoning_content"
+        ).strip()
+
+        if not content and reasoning_content:
+            logger.info(
+                "Content is empty but reasoning_content is present. "
+                "Falling back to reasoning_content for structured output parsing."
+            )
+            content = reasoning_content
+
+        return content
+
+    def _parse_structured_response(
+        self, content: str, response_model: type[BaseModel]
+    ) -> BaseModel:
+        """Normalize and validate structured model output."""
+        content = self._coerce_structured_payload(content, response_model)
+        return response_model.model_validate_json(content)
+
     def chat_completion(
         self,
         messages: list,
@@ -200,6 +229,12 @@ class LLMClient:
         """
         Send a chat completion request to the LLM API using LiteLLM.
         """
+        structured_output_retries = kwargs.pop(
+            "structured_output_retries", self.config.structured_output_retries
+        )
+        if structured_output_retries < 0:
+            raise ValueError("Number of structured output retries cannot be negative")
+
         # Build payload parameters
         api_params = {
             "model": self.config.model,
@@ -236,25 +271,23 @@ class LLMClient:
         )
 
         try:
-            response = litellm.completion(**api_params)
-            message = response.choices[0].message
-            content = self._get_message_value(message, "content").strip()
-            reasoning_content = self._get_message_value(
-                message, "reasoning_content"
-            ).strip()
+            if not response_model:
+                return self._completion_content(api_params)
 
-            if not content and reasoning_content:
-                logger.info(
-                    "Content is empty but reasoning_content is present. "
-                    "Falling back to reasoning_content for structured output parsing."
-                )
-                content = reasoning_content
+            validation_attempts = structured_output_retries + 1
+            for attempt in range(1, validation_attempts + 1):
+                content = self._completion_content(api_params)
+                try:
+                    return self._parse_structured_response(content, response_model)
+                except ValidationError as e:
+                    if attempt >= validation_attempts:
+                        raise
+                    logger.warning(
+                        "LLM returned invalid structured output on attempt "
+                        f"{attempt}/{validation_attempts}; retrying. Error: {e}"
+                    )
 
-            if response_model:
-                # Natively parse and validate the JSON string into the Pydantic model
-                content = self._coerce_structured_payload(content, response_model)
-                return response_model.model_validate_json(content)
-            return content
+            raise RuntimeError("Structured output retry loop exited unexpectedly")
 
         except Exception as e:
             logger.error(f"Error during LLM API call: {e}")

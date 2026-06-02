@@ -697,6 +697,87 @@ class TestBatchTranslationSafety(unittest.TestCase):
                 num_retries=-1,
             )
 
+    def test_llm_client_retries_invalid_structured_output(self):
+        """Malformed model JSON should trigger a fresh structured-output attempt."""
+
+        bad_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{\n  "translations":',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        good_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(provider="openrouter", model="openrouter/owl-alpha")
+
+        with patch(
+            "llm_provider.litellm.completion",
+            side_effect=[bad_response, good_response],
+        ) as mock_completion:
+            result = LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+            )
+
+        self.assertEqual(mock_completion.call_count, 2)
+        self.assertEqual(
+            [(item.key, item.translation) for item in result.translations],
+            [("hello", "Hola")],
+        )
+
+    def test_llm_client_allows_structured_output_retry_override(self):
+        """Callers can disable app-level structured output retries per request."""
+
+        bad_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{\n  "translations":',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(provider="openrouter", model="openrouter/owl-alpha")
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=bad_response
+        ) as mock_completion:
+            with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+                LLMClient(llm_config).chat_completion(
+                    messages=[],
+                    response_model=StringBatchTranslation,
+                    temperature=0,
+                    structured_output_retries=0,
+                )
+
+        self.assertEqual(mock_completion.call_count, 1)
+
+    def test_llm_config_rejects_negative_structured_output_retries(self):
+        """Structured output retry count must not be negative."""
+
+        with self.assertRaisesRegex(
+            ValueError, "Number of structured output retries cannot be negative"
+        ):
+            LLMConfig(
+                provider="openrouter",
+                model="openrouter/owl-alpha",
+                structured_output_retries=-1,
+            )
+
     def test_llm_client_accepts_dict_style_message(self):
         """LiteLLM responses can expose message data with dict-style access."""
 
