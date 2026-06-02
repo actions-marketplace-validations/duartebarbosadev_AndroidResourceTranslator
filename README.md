@@ -1,6 +1,6 @@
 # Android Resource Translator
 
-**Android Resource Translator** scans `strings.xml` files for missing translations and automatically translates them using AI language models (OpenAI or OpenRouter).
+**Android Resource Translator** scans `strings.xml` files for missing translations and automatically translates them using modern LLM providers.
 
 [![GitHub Action](https://img.shields.io/badge/GitHub%20Action-enabled-brightgreen)](https://github.com/marketplace/actions/android-resource-translator)
 
@@ -109,15 +109,40 @@ Please note that each time the action runs, it will process **all** missing tran
 
 We recommend the model google/gemini-2.5-flash as it got the best results in our testing and is not as expensive as other models.
 
+## Supported LLM Providers & Models (via LiteLLM)
+
+Thanks to the integration of [LiteLLM](https://github.com/BerriAI/litellm), this tool natively supports **100+ LLM providers**. You can check the [LiteLLM repository](https://github.com/BerriAI/litellm) and their [providers documentation](https://docs.litellm.ai/docs/providers) to see the full list of supported models and setup guides.
+
+### 1. Direct API Providers
+Specify the `llm_provider` and `model` in your inputs, and supply the corresponding API key as a repository secret:
+
+* **Anthropic Claude**:
+  * `llm_provider: anthropic`
+  * `model: claude-3-5-sonnet-latest`
+  * Environment variable: `ANTHROPIC_API_KEY`
+* **Google Gemini (Direct API)**:
+  * `llm_provider: gemini`
+  * `model: gemini/gemini-2.5-flash` (or `gemini/gemini-2.5-pro`)
+  * Environment variable: `GEMINI_API_KEY`
+* **Azure OpenAI**:
+  * `llm_provider: azure`
+  * Environment variables: standard Azure keys (`AZURE_API_KEY`, `AZURE_API_BASE`, etc.)
+
+### 2. Local / Offline Translation (Free & Private)
+You can run models locally using **Ollama**:
+* **Ollama**:
+  * `llm_provider: ollama`
+  * `model: ollama/llama3`
+
 ## Local Execution
 
 To run the translator on your local machine, execute:
 
 ```bash
-python AndroidResourceTranslator.py /path/to/your/android/project
+python app/AndroidResourceTranslator.py /path/to/your/android/project
 ```
 
-You can also pass additional parameters like `--project-context` or `--dry-run` (to only check for missing translations without translating) as needed.
+You can also pass additional parameters like `--api-key`, `--project-context`, or `--dry-run` (to only check for missing translations without translating) as needed.
 
 ## Configuration
 
@@ -128,8 +153,8 @@ The action supports the following inputs:
 | **resources_paths**          | Paths to the Android resource directories. Typically includes directories such as `app/src/main/res`, `library/src/main/res`, etc. If not provided, this action will search throughout the entire project folder.                         | `${{ github.workspace }}`                                              | Yes      | `./app/src/main/res, ./library/src/main/res, ./feature/src/main/res`   |
 | **dry_run**                  | Run in dry-run mode (only report missing translations without translating). Set to `"true"` to enable dry-run mode.                                                                                                                           | `"false"`                                                              | Yes      | `"true"` or `"false"`                                                  |
 | **log_trace**                | Enable detailed logging. Use `"true"` for verbose output.                                                                                                                                                                                     | `"false"`                                                              | Yes      | `"true"`                                                               |
-| **llm_provider**             | LLM provider to use for translation. Options are `"openai"` or `"openrouter"`.                                                                                                                                                                 | `"openrouter"`                                                             | Yes      | `"openai"`, `"openrouter"`                                              |
-| **model**                    | Model to use for translation. For OpenAI: `gpt-4o-mini`, `gpt-4o`, etc. For OpenRouter: `anthropic/claude-sonnet-4.5` (recommended), `anthropic/claude-sonnet-4.5`, etc.                                                                                     | `"google/gemini-2.5-flash"`                                                        | Yes      | `"google/gemini-2.5-flash"`, `"anthropic/claude-sonnet-4.5"`         |
+| **llm_provider**             | LLM provider to use for translation. Options include `"openai"`, `"openrouter"`, `"anthropic"`, `"gemini"`, `"azure"`, `"ollama"`, etc. (via LiteLLM).                                                                                                                                                                 | `"openrouter"`                                                             | Yes      | `"openai"`, `"openrouter"`, `"anthropic"`, `"gemini"`, `"ollama"`          |
+| **model**                    | Model to use for translation. Supports all models from the chosen provider (e.g. `gpt-4o-mini`, `google/gemini-2.5-flash`, `claude-3-5-sonnet-latest`, `ollama/llama3`).                                                                                     | `"google/gemini-2.5-flash"`                                                        | Yes      | `"google/gemini-2.5-flash"`, `"gpt-4o-mini"`, `"claude-3-5-sonnet-latest"`|
 | **openrouter_site_url**      | Your site URL for OpenRouter rankings. Used to identify your application in OpenRouter analytics.                                                                                                                                             | `"https://github.com/duartebarbosadev/AndroidResourceTranslator"`     | Yes      | ``                         |
 | **openrouter_site_name**     | Your site name for OpenRouter rankings. Used to identify your application in OpenRouter analytics.                                                                                                                                            | `"AndroidResourceTranslatorAction"`                                    | Yes      | `""`                                                        |
 | **openrouter_send_site_info** | Send site URL and name to OpenRouter for rankings. Set to `"false"` to disable.                                                                                                                                                               | `"true"`                                                               | Yes      | `"true"` or `"false"`                                                  |
@@ -137,15 +162,23 @@ The action supports the following inputs:
 | **ignore_folders**           | Comma-separated list of folder names to ignore during resource scanning. If empty, .gitignore file will be used instead.                                                                                                                     | `""`                                                                   | Yes      | `"build,temp,cache"`                                                   |
 | **include_reference_context** | Include existing translations from the destination language as context when prompting the LLM. Set to `"false"` to disable the extra context entirely.                                                                                       | `"true"`                                                               | Yes      | `"false"`                                                              |
 | **reference_context_limit**  | Maximum number of existing translations to send as context examples. Use `"0"` to skip sending any reference strings even if context is enabled.                                                                                               | `"25"`                                                                 | Yes      | `"10"`                                                                 |
+| **batch_size**               | Maximum number of items to translate in a single batch API call. Decrease this if you are using a local model with reasoning that gets truncated by token limits.                                                                             | `"10"`                                                                 | Yes      | `"10"`, `"5"`                                                          |
 
 ### Environment Variables (API Keys)
 
-Set these as repository secrets and pass them via `env:` in your workflow:
+Since the engine natively integrates **LiteLLM**, it automatically supports any LLM provider key by mapping them dynamically.
 
-| Variable                | Description                                      | Required For                    |
-| ----------------------- | ------------------------------------------------ | ------------------------------- |
-| **OPENAI_API_KEY**      | OpenAI API key                                   | OpenAI provider                 |
-| **OPENROUTER_API_KEY**  | OpenRouter API key                               | OpenRouter provider             |
+Set the appropriate key as a repository secret and pass it via `env:` in your workflow:
+
+* **Universal Variable**: You can pass a generic **`API_KEY`** which works across all providers, or pass it directly on the command line via `--api-key YOUR_KEY`.
+* **Provider-Specific Variables**: The script automatically detects and resolves `{PROVIDER}_API_KEY` depending on what you supply in `llm_provider`. For example:
+  * **`OPENAI_API_KEY`** when using `llm_provider: openai`
+  * **`OPENROUTER_API_KEY`** when using `llm_provider: openrouter`
+  * **`ANTHROPIC_API_KEY`** when using `llm_provider: anthropic`
+  * **`GEMINI_API_KEY`** when using `llm_provider: gemini`
+  * **`GROQ_API_KEY`** when using `llm_provider: groq`
+  * **`MISTRAL_API_KEY`** when using `llm_provider: mistral`
+  * ... and any other [LiteLLM-supported provider key](https://docs.litellm.ai/docs/providers)!
 
 ## Translation Report Output
 
