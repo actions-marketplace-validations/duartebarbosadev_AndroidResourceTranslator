@@ -18,6 +18,7 @@ import litellm
 
 logger = logging.getLogger(__name__)
 DEFAULT_LLM_TIMEOUT_SECONDS = 60
+DEFAULT_LLM_RETRIES = 2
 
 # Suppress noisy logging from litellm/openai unless error/warning
 litellm.set_verbose = False
@@ -118,11 +119,14 @@ class LLMConfig:
     site_name: Optional[str] = None
     send_site_info: bool = True
     timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
+    num_retries: int = DEFAULT_LLM_RETRIES
 
     def __post_init__(self):
         """Validate configuration after initialization."""
         if not self.model:
             raise ValueError("Model name is required")
+        if self.num_retries < 0:
+            raise ValueError("Number of retries cannot be negative")
 
 
 class LLMClient:
@@ -204,6 +208,7 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": kwargs.pop("max_tokens", 4096),
             "timeout": kwargs.pop("timeout", self.config.timeout_seconds),
+            "num_retries": kwargs.pop("num_retries", self.config.num_retries),
             **kwargs,
         }
 

@@ -656,6 +656,46 @@ class TestBatchTranslationSafety(unittest.TestCase):
             [("hello", "Hola"), ("goodbye", "Adiós")],
         )
         self.assertEqual(mock_completion.call_args.kwargs["timeout"], 60)
+        self.assertEqual(mock_completion.call_args.kwargs["num_retries"], 2)
+
+    def test_llm_client_allows_retry_override(self):
+        """Callers can override the default LiteLLM retry count per request."""
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(
+            provider="openrouter", model="openrouter/owl-alpha", num_retries=4
+        )
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=response
+        ) as mock_completion:
+            LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+                num_retries=1,
+            )
+
+        self.assertEqual(mock_completion.call_args.kwargs["num_retries"], 1)
+
+    def test_llm_config_rejects_negative_retries(self):
+        """Retry count must not disable validation by going negative."""
+
+        with self.assertRaisesRegex(ValueError, "Number of retries cannot be negative"):
+            LLMConfig(
+                provider="openrouter",
+                model="openrouter/owl-alpha",
+                num_retries=-1,
+            )
 
     def test_llm_client_accepts_dict_style_message(self):
         """LiteLLM responses can expose message data with dict-style access."""
