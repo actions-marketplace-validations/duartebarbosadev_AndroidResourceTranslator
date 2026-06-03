@@ -18,6 +18,7 @@ import litellm
 
 logger = logging.getLogger(__name__)
 DEFAULT_LLM_TIMEOUT_SECONDS = 60
+DEFAULT_LLM_MAX_TOKENS = 4096
 DEFAULT_LLM_RETRIES = 2
 DEFAULT_STRUCTURED_OUTPUT_RETRIES = 1
 
@@ -120,6 +121,7 @@ class LLMConfig:
     site_name: Optional[str] = None
     send_site_info: bool = True
     timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
+    max_tokens: int = DEFAULT_LLM_MAX_TOKENS
     num_retries: int = DEFAULT_LLM_RETRIES
     structured_output_retries: int = DEFAULT_STRUCTURED_OUTPUT_RETRIES
 
@@ -127,6 +129,8 @@ class LLMConfig:
         """Validate configuration after initialization."""
         if not self.model:
             raise ValueError("Model name is required")
+        if self.max_tokens <= 0:
+            raise ValueError("Max tokens must be greater than zero")
         if self.num_retries < 0:
             raise ValueError("Number of retries cannot be negative")
         if self.structured_output_retries < 0:
@@ -241,7 +245,7 @@ class LLMClient:
             "custom_llm_provider": self.config.provider,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": kwargs.pop("max_tokens", 4096),
+            "max_tokens": kwargs.pop("max_tokens", self.config.max_tokens),
             "timeout": kwargs.pop("timeout", self.config.timeout_seconds),
             "num_retries": kwargs.pop("num_retries", self.config.num_retries),
             **kwargs,

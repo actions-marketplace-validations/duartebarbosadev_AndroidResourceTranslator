@@ -656,7 +656,69 @@ class TestBatchTranslationSafety(unittest.TestCase):
             [("hello", "Hola"), ("goodbye", "Adiós")],
         )
         self.assertEqual(mock_completion.call_args.kwargs["timeout"], 60)
+        self.assertEqual(mock_completion.call_args.kwargs["max_tokens"], 2048)
         self.assertEqual(mock_completion.call_args.kwargs["num_retries"], 2)
+
+    def test_llm_client_uses_configured_max_tokens(self):
+        """Configured max tokens should be used when no per-call override is provided."""
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(
+            provider="openrouter",
+            model="openrouter/owl-alpha",
+            max_tokens=1234,
+        )
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=response
+        ) as mock_completion:
+            LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+            )
+
+        self.assertEqual(mock_completion.call_args.kwargs["max_tokens"], 1234)
+
+    def test_llm_client_allows_max_tokens_override(self):
+        """Callers can override max tokens per request."""
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(
+            provider="openrouter",
+            model="openrouter/owl-alpha",
+            max_tokens=1234,
+        )
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=response
+        ) as mock_completion:
+            LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+                max_tokens=512,
+            )
+
+        self.assertEqual(mock_completion.call_args.kwargs["max_tokens"], 512)
 
     def test_llm_client_allows_retry_override(self):
         """Callers can override the default LiteLLM retry count per request."""
@@ -695,6 +757,16 @@ class TestBatchTranslationSafety(unittest.TestCase):
                 provider="openrouter",
                 model="openrouter/owl-alpha",
                 num_retries=-1,
+            )
+
+    def test_llm_config_rejects_non_positive_max_tokens(self):
+        """Max tokens must be positive because providers reject invalid caps."""
+
+        with self.assertRaisesRegex(ValueError, "Max tokens must be greater than zero"):
+            LLMConfig(
+                provider="openrouter",
+                model="openrouter/owl-alpha",
+                max_tokens=0,
             )
 
     def test_llm_client_retries_invalid_structured_output(self):
