@@ -964,6 +964,45 @@ class TestBatchTranslationSafety(unittest.TestCase):
                     llm_config=llm_config,
                 )
 
+    def test_translate_strings_batch_names_target_language_in_prompt(self):
+        """Batch string prompts should repeat the concrete target locale and language."""
+
+        from llm_provider import StringBatchItem, StringBatchTranslation
+
+        captured_messages = []
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                captured_messages.extend(kwargs["messages"])
+                return StringBatchTranslation(
+                    translations=[
+                        StringBatchItem(key="title", translation="Título"),
+                    ]
+                )
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_strings_batch_with_llm(
+                strings_dict={"title": "Title"},
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+                target_language="Spanish",
+                target_locale="es",
+            )
+
+        self.assertEqual(result, {"title": "Título"})
+        user_prompt = captured_messages[1]["content"]
+        self.assertIn("Android locale: es", user_prompt)
+        self.assertIn("Spanish only", user_prompt)
+        self.assertIn("Do not use another language or dialect", user_prompt)
+
     def test_translate_plural_uses_single_quantity_as_other_fallback(self):
         """Plural translation should recover when the model omits Android's fallback."""
 
@@ -1054,6 +1093,52 @@ class TestBatchTranslationSafety(unittest.TestCase):
             )
 
         self.assertEqual(result, {"days_left": {"one": "1 día", "other": "1 día"}})
+
+    def test_translate_plurals_batch_names_target_language_in_prompt(self):
+        """Batch plural prompts should repeat the concrete target locale and language."""
+
+        from llm_provider import (
+            PluralBatchItem,
+            PluralTranslation,
+            PluralsBatchTranslation,
+        )
+
+        captured_messages = []
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                captured_messages.extend(kwargs["messages"])
+                return PluralsBatchTranslation(
+                    translations=[
+                        PluralBatchItem(
+                            plural_name="days_left",
+                            quantities=PluralTranslation(other="%d días"),
+                        )
+                    ]
+                )
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_plurals_batch_with_llm(
+                plurals_dict={"days_left": {"other": "%d days"}},
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+                target_language="Spanish",
+                target_locale="es",
+            )
+
+        self.assertEqual(result, {"days_left": {"other": "%d días"}})
+        user_prompt = captured_messages[1]["content"]
+        self.assertIn("Android locale: es", user_prompt)
+        self.assertIn("Spanish only", user_prompt)
+        self.assertIn("Do not use another language or dialect", user_prompt)
 
     def test_translate_plurals_batch_raises_on_missing_plurals(self):
         """Batch plural translation should reject partial LLM batch results."""

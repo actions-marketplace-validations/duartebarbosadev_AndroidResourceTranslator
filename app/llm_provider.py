@@ -18,7 +18,7 @@ import litellm
 
 logger = logging.getLogger(__name__)
 DEFAULT_LLM_TIMEOUT_SECONDS = 60
-DEFAULT_LLM_MAX_TOKENS = 4096
+DEFAULT_LLM_MAX_TOKENS = 2048
 DEFAULT_LLM_RETRIES = 2
 DEFAULT_STRUCTURED_OUTPUT_RETRIES = 1
 
@@ -373,6 +373,8 @@ def translate_strings_batch_with_llm(
     user_prompt: str,
     llm_config: LLMConfig,
     reference_examples: Optional[List[Dict[str, str]]] = None,
+    target_language: Optional[str] = None,
+    target_locale: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Translate multiple strings in a single API call using structured output validation.
@@ -385,6 +387,15 @@ def translate_strings_batch_with_llm(
     strings_json = json.dumps(strings_dict, indent=2, ensure_ascii=False)
     full_user_prompt = user_prompt
 
+    if target_language:
+        locale_part = f" Android locale: {target_locale}." if target_locale else ""
+        full_user_prompt += (
+            "\n\nTarget language requirement:"
+            f"{locale_part} Translate from English into {target_language} only. "
+            "Every returned value must be in this target language and locale. "
+            "Do not use another language or dialect, even if nearby examples use one."
+        )
+
     if reference_examples:
         reference_json = json.dumps(reference_examples, indent=2, ensure_ascii=False)
         full_user_prompt += (
@@ -394,7 +405,7 @@ def translate_strings_batch_with_llm(
         )
 
     full_user_prompt += (
-        "\n\nTranslate ALL the strings below from English to the target language.\n"
+        "\n\nTranslate ALL the strings below from English to the target language named above.\n"
         + "The strings are provided as JSON key-value pairs. Translate only the values:\n"
         + strings_json
     )
@@ -432,6 +443,8 @@ def translate_plurals_batch_with_llm(
     user_prompt: str,
     llm_config: LLMConfig,
     reference_examples: Optional[List[Dict[str, Any]]] = None,
+    target_language: Optional[str] = None,
+    target_locale: Optional[str] = None,
 ) -> Dict[str, Dict[str, str]]:
     """
     Translate multiple plural resources in a single API call using structured output validation.
@@ -444,6 +457,15 @@ def translate_plurals_batch_with_llm(
     plurals_json = json.dumps(plurals_dict, indent=2, ensure_ascii=False)
     full_user_prompt = user_prompt
 
+    if target_language:
+        locale_part = f" Android locale: {target_locale}." if target_locale else ""
+        full_user_prompt += (
+            "\n\nTarget language requirement:"
+            f"{locale_part} Translate from English into {target_language} only. "
+            "Every returned value must be in this target language and locale. "
+            "Do not use another language or dialect, even if nearby examples use one."
+        )
+
     if reference_examples:
         reference_json = json.dumps(reference_examples, indent=2, ensure_ascii=False)
         full_user_prompt += (
@@ -452,7 +474,7 @@ def translate_plurals_batch_with_llm(
         )
 
     full_user_prompt += (
-        "\n\nTranslate ALL the plural resources below from English to the target language.\n"
+        "\n\nTranslate ALL the plural resources below from English to the target language named above.\n"
         + "Each plural resource has a name and quantity forms. Translate the text in each quantity form:\n"
         + plurals_json
     )

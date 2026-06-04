@@ -87,7 +87,7 @@ jobs:
           EOF
 
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: auto-translate  # Use a fixed branch name
           commit-message: "[Translate Bot] Auto-generated translations for non-English languages"

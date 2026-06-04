@@ -134,7 +134,11 @@ For plural resources, follow these guidelines:
    (Adjust the text according to correct singular and plural usage in the target language. Use the appropriate plural keys for the target language: zero, one, two, few, many, and other.)
 """
 SYSTEM_MESSAGE_TEMPLATE = """\
-You are a professional translator translating textual UI elements within an Android from English into {target_language}. Follow user guidelines closely.
+You are a professional translator translating textual UI elements within an Android app from English.
+Target Android locale: {target_locale}
+Target language: {target_language}
+Return translations only in the target language and locale above. Using a different language or dialect is invalid.
+Follow user guidelines closely.
 """
 
 
@@ -1138,7 +1142,10 @@ def _translate_missing_strings(
     base_prompt = TRANSLATION_GUIDELINES
 
     # Configure the system message
-    system_message = SYSTEM_MESSAGE_TEMPLATE.format(target_language=language_name)
+    system_message = SYSTEM_MESSAGE_TEMPLATE.format(
+        target_locale=lang,
+        target_language=language_name,
+    )
     if project_context:
         system_message += f"\nProject context: {project_context}"
 
@@ -1170,6 +1177,8 @@ def _translate_missing_strings(
             "system_message": system_message,
             "user_prompt": base_prompt,
             "llm_config": llm_config,
+            "target_language": language_name,
+            "target_locale": lang,
         }
 
         if include_reference_context and reference_examples:
@@ -1252,7 +1261,10 @@ def _translate_missing_plurals(
     base_prompt = TRANSLATION_GUIDELINES + PLURAL_GUIDELINES_ADDITION
 
     # Configure the system message
-    system_message = SYSTEM_MESSAGE_TEMPLATE.format(target_language=language_name)
+    system_message = SYSTEM_MESSAGE_TEMPLATE.format(
+        target_locale=lang,
+        target_language=language_name,
+    )
     if project_context:
         system_message += f"\nProject context: {project_context}"
 
@@ -1284,6 +1296,8 @@ def _translate_missing_plurals(
             "system_message": system_message,
             "user_prompt": base_prompt,
             "llm_config": llm_config,
+            "target_language": language_name,
+            "target_locale": lang,
         }
 
         if include_reference_context and reference_examples:
