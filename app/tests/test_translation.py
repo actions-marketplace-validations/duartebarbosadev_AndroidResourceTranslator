@@ -10,7 +10,10 @@ This module tests the text translation and OpenAI integration features including
 
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 # Add parent directory to path for module import
@@ -19,13 +22,28 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from AndroidResourceTranslator import (
     auto_translate_resources,
     AndroidModule,
+    UpdatedDefaultResources,
+    detect_updated_default_resources,
+    _find_updated_default_resource_entries,
+    _normalize_github_event_path,
+    _normalize_llm_provider,
+    _resolve_api_key,
+    _validate_api_key_for_provider,
 )
 from string_utils import (
     escape_apostrophes,
     escape_double_quotes,
     escape_special_chars,
 )
-from llm_provider import LLMConfig, LLMProvider
+from llm_provider import (
+    LLMClient,
+    LLMConfig,
+    StringBatchTranslation,
+    translate_plural_with_llm,
+    translate_plurals_batch_with_llm,
+    translate_with_llm,
+    translate_strings_batch_with_llm,
+)
 
 
 class TestSpecialCharacterEscaping(unittest.TestCase):
@@ -202,6 +220,85 @@ class TestAutoTranslation(unittest.TestCase):
         # Build modules dict
         self.modules = {"test_id": self.module}
 
+    def test_find_updated_default_resource_entries_only_existing_changes(self):
+        """Only changed existing default entries should be marked for refresh."""
+        current_resource = MagicMock()
+        current_resource.strings = {
+            "hello": "Hello again",
+            "new": "New string",
+            "same": "Same",
+        }
+        current_resource.plurals = {
+            "days": {"one": "%d day left", "other": "%d days left"},
+            "new_plural": {"other": "%d new items"},
+            "same_plural": {"other": "%d item"},
+        }
+
+        updated = _find_updated_default_resource_entries(
+            previous_strings={"hello": "Hello", "same": "Same"},
+            previous_plurals={
+                "days": {"one": "%d day", "other": "%d days"},
+                "same_plural": {"other": "%d item"},
+            },
+            current_resource=current_resource,
+        )
+
+        self.assertEqual(updated.strings, {"hello"})
+        self.assertEqual(updated.plurals, {"days"})
+
+    def test_normalize_github_event_path_preserves_leading_dot_directories(self):
+        """Only a literal ./ prefix should be removed from event paths."""
+        self.assertEqual(
+            _normalize_github_event_path("./app/src/main/res/values/strings.xml"),
+            "app/src/main/res/values/strings.xml",
+        )
+        self.assertEqual(
+            _normalize_github_event_path(".github/workflows/translate.yml"),
+            ".github/workflows/translate.yml",
+        )
+
+    @patch("AndroidResourceTranslator._read_github_event_modified_paths")
+    @patch("AndroidResourceTranslator._resolve_previous_commit_ref")
+    @patch("AndroidResourceTranslator._run_git_command")
+    def test_detect_updated_default_resources_falls_back_to_modified_event_path(
+        self,
+        mock_run_git_command,
+        mock_resolve_previous_commit_ref,
+        mock_read_modified_paths,
+    ):
+        """A shallow GitHub checkout should refresh all entries in modified defaults."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo_root = os.path.realpath(tmp_dir)
+            resource_path = os.path.join(
+                repo_root, "app", "src", "main", "res", "values", "strings.xml"
+            )
+
+            default_resource = MagicMock()
+            default_resource.path = Path(resource_path)
+            default_resource.strings = {"hello": "Hello", "goodbye": "Goodbye"}
+            default_resource.plurals = {"days": {"other": "%d days"}}
+
+            module = AndroidModule("test_module", "test_id")
+            module.language_resources["default"] = [default_resource]
+
+            def git_side_effect(args, cwd, text=True):
+                if args == ["rev-parse", "--show-toplevel"]:
+                    return repo_root
+                if args[:3] == ["status", "--porcelain", "--"]:
+                    return ""
+                return None
+
+            mock_run_git_command.side_effect = git_side_effect
+            mock_resolve_previous_commit_ref.return_value = None
+            mock_read_modified_paths.return_value = {
+                "app/src/main/res/values/strings.xml"
+            }
+
+            updated = detect_updated_default_resources({"test_id": module})
+
+        self.assertEqual(updated["test_id"].strings, {"hello", "goodbye"})
+        self.assertEqual(updated["test_id"].plurals, {"days"})
+
     @patch("AndroidResourceTranslator.translate_plurals_batch_with_llm")
     @patch("AndroidResourceTranslator.translate_strings_batch_with_llm")
     @patch("AndroidResourceTranslator.update_xml_file")
@@ -220,7 +317,7 @@ class TestAutoTranslation(unittest.TestCase):
 
         # Create LLMConfig
         llm_config = LLMConfig(
-            provider=LLMProvider.OPENAI, api_key="test_api_key", model="test-model"
+            provider="openai", api_key="test_api_key", model="test-model"
         )
 
         # Execute auto translation
@@ -280,6 +377,807 @@ class TestAutoTranslation(unittest.TestCase):
         self.assertIn("es", result["test_module"])
         self.assertIn("strings", result["test_module"]["es"])
         self.assertIn("plurals", result["test_module"]["es"])
+
+    @patch("AndroidResourceTranslator.translate_plurals_batch_with_llm")
+    @patch("AndroidResourceTranslator.translate_strings_batch_with_llm")
+    @patch("AndroidResourceTranslator.update_xml_file")
+    def test_auto_translate_refreshes_updated_existing_string(
+        self,
+        mock_update_xml,
+        mock_translate_strings_batch,
+        mock_translate_plurals_batch,
+    ):
+        """Changed default strings should retranslate existing target entries."""
+        self.default_resource.strings = {
+            "hello": "Hello again",
+            "goodbye": "Goodbye",
+        }
+        self.es_resource.strings = {
+            "hello": "Hola Mundo",
+            "goodbye": "Adiós",
+        }
+        self.es_resource.plurals = {
+            "days": {"one": "%d día", "other": "%d días"},
+        }
+        mock_translate_strings_batch.return_value = {"hello": "Hola de nuevo"}
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        result = auto_translate_resources(
+            self.modules,
+            llm_config=llm_config,
+            project_context="Test project",
+            updated_default_resources={
+                "test_id": UpdatedDefaultResources(strings={"hello"})
+            },
+        )
+
+        mock_translate_strings_batch.assert_called_once()
+        strings_payload = mock_translate_strings_batch.call_args.kwargs["strings_dict"]
+        self.assertEqual(strings_payload, {"hello": "Hello again"})
+        mock_translate_plurals_batch.assert_not_called()
+        mock_update_xml.assert_called_once_with(self.es_resource)
+        self.assertEqual(self.es_resource.strings["hello"], "Hola de nuevo")
+        self.assertEqual(
+            result["test_module"]["es"]["strings"][0]["source"], "Hello again"
+        )
+
+    @patch("AndroidResourceTranslator.translate_plurals_batch_with_llm")
+    @patch("AndroidResourceTranslator.translate_strings_batch_with_llm")
+    @patch("AndroidResourceTranslator.update_xml_file")
+    def test_auto_translate_refreshes_updated_existing_plural(
+        self,
+        mock_update_xml,
+        mock_translate_strings_batch,
+        mock_translate_plurals_batch,
+    ):
+        """Changed default plurals should replace existing target plural entries."""
+        self.es_resource.strings = {
+            "hello": "Hola Mundo",
+            "goodbye": "Adiós",
+        }
+        self.es_resource.plurals = {
+            "days": {
+                "one": "%d día antiguo",
+                "few": "%d días antiguos",
+                "other": "%d días antiguos",
+            }
+        }
+        mock_translate_plurals_batch.return_value = {
+            "days": {"one": "%d día nuevo", "other": "%d días nuevos"}
+        }
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        auto_translate_resources(
+            self.modules,
+            llm_config=llm_config,
+            project_context="Test project",
+            updated_default_resources={
+                "test_id": UpdatedDefaultResources(plurals={"days"})
+            },
+        )
+
+        mock_translate_strings_batch.assert_not_called()
+        mock_translate_plurals_batch.assert_called_once()
+        plurals_payload = mock_translate_plurals_batch.call_args.kwargs["plurals_dict"]
+        self.assertEqual(
+            plurals_payload, {"days": {"one": "%d day", "other": "%d days"}}
+        )
+        mock_update_xml.assert_called_once_with(self.es_resource)
+        self.assertEqual(
+            self.es_resource.plurals["days"],
+            {"one": "%d día nuevo", "other": "%d días nuevos"},
+        )
+
+    @patch("AndroidResourceTranslator.translate_plurals_batch_with_llm")
+    @patch("AndroidResourceTranslator.translate_strings_batch_with_llm")
+    @patch("AndroidResourceTranslator.update_xml_file")
+    def test_auto_translate_skips_plurals_when_target_has_extra_valid_forms(
+        self,
+        mock_update_xml,
+        mock_translate_strings_batch,
+        mock_translate_plurals_batch,
+    ):
+        """Extra locale-specific plural forms should not trigger retranslation."""
+        module = AndroidModule("test_module", "test_id")
+
+        default_resource = MagicMock()
+        default_resource.strings = {}
+        default_resource.plurals = {"days": {"other": "%d days"}}
+        default_resource.modified = False
+
+        sv_resource = MagicMock()
+        sv_resource.strings = {}
+        sv_resource.plurals = {
+            "days": {
+                "one": "%d dag",
+                "few": "%d dagar",
+                "other": "%d dagar",
+            }
+        }
+        sv_resource.modified = False
+
+        module.add_resource("default", default_resource)
+        module.add_resource("sv", sv_resource)
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        result = auto_translate_resources(
+            {"test_id": module},
+            llm_config=llm_config,
+            project_context="Test project",
+        )
+
+        mock_translate_strings_batch.assert_not_called()
+        mock_translate_plurals_batch.assert_not_called()
+        mock_update_xml.assert_not_called()
+        self.assertFalse(sv_resource.modified)
+        self.assertEqual(sv_resource.plurals["days"]["few"], "%d dagar")
+        self.assertEqual(result["test_module"]["sv"]["plurals"], [])
+
+    @patch("AndroidResourceTranslator.translate_plurals_batch_with_llm")
+    @patch("AndroidResourceTranslator.translate_strings_batch_with_llm")
+    @patch("AndroidResourceTranslator.update_xml_file")
+    def test_auto_translate_skips_existing_plural_when_target_only_has_other(
+        self,
+        mock_update_xml,
+        mock_translate_strings_batch,
+        mock_translate_plurals_batch,
+    ):
+        """A target plural that already exists should not be retransmitted."""
+        module = AndroidModule("test_module", "test_id")
+
+        default_resource = MagicMock()
+        default_resource.strings = {}
+        default_resource.plurals = {
+            "days": {"one": "%d day", "few": "%d days", "other": "%d days"}
+        }
+        default_resource.modified = False
+
+        target_resource = MagicMock()
+        target_resource.strings = {}
+        target_resource.plurals = {"days": {"other": "%d dias"}}
+        target_resource.modified = False
+
+        module.add_resource("default", default_resource)
+        module.add_resource("pt", target_resource)
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        result = auto_translate_resources(
+            {"test_id": module},
+            llm_config=llm_config,
+            project_context="Test project",
+        )
+
+        mock_translate_strings_batch.assert_not_called()
+        mock_translate_plurals_batch.assert_not_called()
+        mock_update_xml.assert_not_called()
+        self.assertFalse(target_resource.modified)
+        self.assertEqual(target_resource.plurals["days"], {"other": "%d dias"})
+        self.assertEqual(result["test_module"]["pt"]["plurals"], [])
+
+    @patch("AndroidResourceTranslator.translate_strings_batch_with_llm")
+    @patch("AndroidResourceTranslator.update_xml_file")
+    def test_auto_translate_raises_on_incomplete_batch_response(
+        self,
+        mock_update_xml,
+        mock_translate_strings_batch,
+    ):
+        """Partial string batches should fail instead of writing empty values."""
+        mock_translate_strings_batch.side_effect = ValueError(
+            "LLM returned an incomplete translations array. Missing keys: goodbye"
+        )
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with self.assertRaisesRegex(ValueError, "Missing keys: goodbye"):
+            auto_translate_resources(
+                self.modules,
+                llm_config=llm_config,
+                project_context="Test project",
+            )
+
+        self.assertNotIn("goodbye", self.es_resource.strings)
+        mock_update_xml.assert_not_called()
+
+
+class TestBatchTranslationSafety(unittest.TestCase):
+    """Tests for safe handling of incomplete batch responses."""
+
+    def test_normalize_llm_provider_defaults_blank_values(self):
+        """Blank provider inputs should not reach LiteLLM as empty providers."""
+
+        self.assertEqual(_normalize_llm_provider(None), "openrouter")
+        self.assertEqual(_normalize_llm_provider("   "), "openrouter")
+        self.assertEqual(_normalize_llm_provider(" OpenAI "), "openai")
+
+    def test_resolve_api_key_ignores_blank_values(self):
+        """Whitespace-only keys should not satisfy API key resolution."""
+
+        with patch.dict(
+            os.environ,
+            {"API_KEY": "   ", "OPENROUTER_API_KEY": " provider-key "},
+            clear=True,
+        ):
+            self.assertEqual(_resolve_api_key("openrouter"), "provider-key")
+
+    def test_validate_api_key_allows_local_providers_without_key(self):
+        """Local providers intentionally do not require remote API credentials."""
+
+        _validate_api_key_for_provider("ollama", None)
+        _validate_api_key_for_provider("lm_studio", "")
+
+    def test_validate_api_key_rejects_remote_provider_without_key(self):
+        """Remote providers should fail before LiteLLM emits provider-specific errors."""
+
+        with self.assertRaisesRegex(
+            ValueError, "API key not found for remote LLM provider 'openrouter'"
+        ):
+            _validate_api_key_for_provider("openrouter", "   ")
+
+    def test_llm_client_accepts_fenced_raw_string_batch_json(self):
+        """Some providers return a fenced key-value map instead of the schema wrapper."""
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='```json\n{"hello": "Hola", "goodbye": "Adiós"}\n```',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(provider="openrouter", model="openrouter/owl-alpha")
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=response
+        ) as mock_completion:
+            result = LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+            )
+
+        self.assertEqual(
+            [(item.key, item.translation) for item in result.translations],
+            [("hello", "Hola"), ("goodbye", "Adiós")],
+        )
+        self.assertEqual(mock_completion.call_args.kwargs["timeout"], 60)
+        self.assertEqual(mock_completion.call_args.kwargs["max_tokens"], 2048)
+        self.assertEqual(mock_completion.call_args.kwargs["num_retries"], 2)
+
+    def test_llm_client_uses_configured_max_tokens(self):
+        """Configured max tokens should be used when no per-call override is provided."""
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(
+            provider="openrouter",
+            model="openrouter/owl-alpha",
+            max_tokens=1234,
+        )
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=response
+        ) as mock_completion:
+            LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+            )
+
+        self.assertEqual(mock_completion.call_args.kwargs["max_tokens"], 1234)
+
+    def test_llm_client_allows_max_tokens_override(self):
+        """Callers can override max tokens per request."""
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(
+            provider="openrouter",
+            model="openrouter/owl-alpha",
+            max_tokens=1234,
+        )
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=response
+        ) as mock_completion:
+            LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+                max_tokens=512,
+            )
+
+        self.assertEqual(mock_completion.call_args.kwargs["max_tokens"], 512)
+
+    def test_llm_client_allows_retry_override(self):
+        """Callers can override the default LiteLLM retry count per request."""
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(
+            provider="openrouter", model="openrouter/owl-alpha", num_retries=4
+        )
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=response
+        ) as mock_completion:
+            LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+                num_retries=1,
+            )
+
+        self.assertEqual(mock_completion.call_args.kwargs["num_retries"], 1)
+
+    def test_llm_config_rejects_negative_retries(self):
+        """Retry count must not disable validation by going negative."""
+
+        with self.assertRaisesRegex(ValueError, "Number of retries cannot be negative"):
+            LLMConfig(
+                provider="openrouter",
+                model="openrouter/owl-alpha",
+                num_retries=-1,
+            )
+
+    def test_llm_config_rejects_non_positive_max_tokens(self):
+        """Max tokens must be positive because providers reject invalid caps."""
+
+        with self.assertRaisesRegex(ValueError, "Max tokens must be greater than zero"):
+            LLMConfig(
+                provider="openrouter",
+                model="openrouter/owl-alpha",
+                max_tokens=0,
+            )
+
+    def test_llm_client_retries_invalid_structured_output(self):
+        """Malformed model JSON should trigger a fresh structured-output attempt."""
+
+        bad_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{\n  "translations":',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        good_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(provider="openrouter", model="openrouter/owl-alpha")
+
+        with patch(
+            "llm_provider.litellm.completion",
+            side_effect=[bad_response, good_response],
+        ) as mock_completion:
+            result = LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+            )
+
+        self.assertEqual(mock_completion.call_count, 2)
+        self.assertEqual(
+            [(item.key, item.translation) for item in result.translations],
+            [("hello", "Hola")],
+        )
+
+    def test_llm_client_allows_structured_output_retry_override(self):
+        """Callers can disable app-level structured output retries per request."""
+
+        bad_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{\n  "translations":',
+                        reasoning_content=None,
+                    )
+                )
+            ]
+        )
+        llm_config = LLMConfig(provider="openrouter", model="openrouter/owl-alpha")
+
+        with patch(
+            "llm_provider.litellm.completion", return_value=bad_response
+        ) as mock_completion:
+            with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+                LLMClient(llm_config).chat_completion(
+                    messages=[],
+                    response_model=StringBatchTranslation,
+                    temperature=0,
+                    structured_output_retries=0,
+                )
+
+        self.assertEqual(mock_completion.call_count, 1)
+
+    def test_llm_config_rejects_negative_structured_output_retries(self):
+        """Structured output retry count must not be negative."""
+
+        with self.assertRaisesRegex(
+            ValueError, "Number of structured output retries cannot be negative"
+        ):
+            LLMConfig(
+                provider="openrouter",
+                model="openrouter/owl-alpha",
+                structured_output_retries=-1,
+            )
+
+    def test_llm_client_accepts_dict_style_message(self):
+        """LiteLLM responses can expose message data with dict-style access."""
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message={
+                        "content": '{"translations": [{"key": "hello", "translation": "Hola"}]}',
+                        "reasoning_content": None,
+                    }
+                )
+            ]
+        )
+        llm_config = LLMConfig(provider="openrouter", model="openrouter/owl-alpha")
+
+        with patch("llm_provider.litellm.completion", return_value=response):
+            result = LLMClient(llm_config).chat_completion(
+                messages=[],
+                response_model=StringBatchTranslation,
+                temperature=0,
+            )
+
+        self.assertEqual(
+            [(item.key, item.translation) for item in result.translations],
+            [("hello", "Hola")],
+        )
+
+    def test_translate_with_llm_includes_text_in_prompt(self):
+        """Single string helper should pass the source text to the model."""
+
+        from llm_provider import SingleTranslation
+
+        captured_messages = []
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                captured_messages.extend(kwargs["messages"])
+                return SingleTranslation(translation="Hola")
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_with_llm(
+                text="Hello",
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+            )
+
+        self.assertEqual(result, "Hola")
+        self.assertIn("Hello", captured_messages[1]["content"])
+
+    def test_translate_plural_with_llm_includes_plural_json_in_prompt(self):
+        """Single plural helper should pass the plural payload to the model."""
+
+        from llm_provider import PluralTranslation
+
+        captured_messages = []
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                captured_messages.extend(kwargs["messages"])
+                return PluralTranslation(other="%d días")
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_plural_with_llm(
+                plural_json='{"other": "%d days"}',
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+            )
+
+        self.assertEqual(result, {"other": "%d días"})
+        self.assertIn('"other": "%d days"', captured_messages[1]["content"])
+
+    def test_translate_strings_batch_raises_on_missing_keys(self):
+        """The adapter should reject partial LLM batch results."""
+
+        from llm_provider import StringBatchTranslation, StringBatchItem
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                return StringBatchTranslation(
+                    translations=[StringBatchItem(key="hello", translation="Hola")]
+                )
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            with self.assertRaisesRegex(ValueError, "Missing keys: goodbye"):
+                translate_strings_batch_with_llm(
+                    strings_dict={"hello": "Hello", "goodbye": "Goodbye"},
+                    system_message="System",
+                    user_prompt="Prompt",
+                    llm_config=llm_config,
+                )
+
+    def test_translate_strings_batch_names_target_language_in_prompt(self):
+        """Batch string prompts should repeat the concrete target locale and language."""
+
+        from llm_provider import StringBatchItem, StringBatchTranslation
+
+        captured_messages = []
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                captured_messages.extend(kwargs["messages"])
+                return StringBatchTranslation(
+                    translations=[
+                        StringBatchItem(key="title", translation="Título"),
+                    ]
+                )
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_strings_batch_with_llm(
+                strings_dict={"title": "Title"},
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+                target_language="Spanish",
+                target_locale="es",
+            )
+
+        self.assertEqual(result, {"title": "Título"})
+        user_prompt = captured_messages[1]["content"]
+        self.assertIn("Android locale: es", user_prompt)
+        self.assertIn("Spanish only", user_prompt)
+        self.assertIn("Do not use another language or dialect", user_prompt)
+
+    def test_translate_plural_uses_single_quantity_as_other_fallback(self):
+        """Plural translation should recover when the model omits Android's fallback."""
+
+        from llm_provider import PluralTranslation
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                return PluralTranslation(one="1 día")
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_plural_with_llm(
+                plural_json='{"one": "1 day"}',
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+            )
+
+        self.assertEqual(result, {"one": "1 día", "other": "1 día"})
+
+    def test_translate_plural_uses_first_quantity_as_other_fallback(self):
+        """Plural translation should recover even when multiple quantities omit other."""
+
+        from llm_provider import PluralTranslation
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                return PluralTranslation(few="%d días", many="%d días")
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_plural_with_llm(
+                plural_json='{"few": "%d days", "many": "%d days"}',
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+            )
+
+        self.assertEqual(
+            result, {"few": "%d días", "many": "%d días", "other": "%d días"}
+        )
+
+    def test_translate_plurals_batch_uses_single_quantity_as_other_fallback(self):
+        """Batch plural translation should recover per plural item."""
+
+        from llm_provider import (
+            PluralBatchItem,
+            PluralTranslation,
+            PluralsBatchTranslation,
+        )
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                return PluralsBatchTranslation(
+                    translations=[
+                        PluralBatchItem(
+                            plural_name="days_left",
+                            quantities=PluralTranslation(one="1 día"),
+                        )
+                    ]
+                )
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_plurals_batch_with_llm(
+                plurals_dict={"days_left": {"one": "1 day"}},
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+            )
+
+        self.assertEqual(result, {"days_left": {"one": "1 día", "other": "1 día"}})
+
+    def test_translate_plurals_batch_names_target_language_in_prompt(self):
+        """Batch plural prompts should repeat the concrete target locale and language."""
+
+        from llm_provider import (
+            PluralBatchItem,
+            PluralTranslation,
+            PluralsBatchTranslation,
+        )
+
+        captured_messages = []
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                captured_messages.extend(kwargs["messages"])
+                return PluralsBatchTranslation(
+                    translations=[
+                        PluralBatchItem(
+                            plural_name="days_left",
+                            quantities=PluralTranslation(other="%d días"),
+                        )
+                    ]
+                )
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            result = translate_plurals_batch_with_llm(
+                plurals_dict={"days_left": {"other": "%d days"}},
+                system_message="System",
+                user_prompt="Prompt",
+                llm_config=llm_config,
+                target_language="Spanish",
+                target_locale="es",
+            )
+
+        self.assertEqual(result, {"days_left": {"other": "%d días"}})
+        user_prompt = captured_messages[1]["content"]
+        self.assertIn("Android locale: es", user_prompt)
+        self.assertIn("Spanish only", user_prompt)
+        self.assertIn("Do not use another language or dialect", user_prompt)
+
+    def test_translate_plurals_batch_raises_on_missing_plurals(self):
+        """Batch plural translation should reject partial LLM batch results."""
+
+        from llm_provider import (
+            PluralBatchItem,
+            PluralTranslation,
+            PluralsBatchTranslation,
+        )
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def chat_completion(self, **kwargs):
+                return PluralsBatchTranslation(
+                    translations=[
+                        PluralBatchItem(
+                            plural_name="days_left",
+                            quantities=PluralTranslation(other="%d días"),
+                        )
+                    ]
+                )
+
+        llm_config = LLMConfig(
+            provider="openai", api_key="test_api_key", model="test-model"
+        )
+
+        with patch("llm_provider.LLMClient", FakeClient):
+            with self.assertRaisesRegex(ValueError, "Missing plurals: items_count"):
+                translate_plurals_batch_with_llm(
+                    plurals_dict={
+                        "days_left": {"other": "%d days"},
+                        "items_count": {"other": "%d items"},
+                    },
+                    system_message="System",
+                    user_prompt="Prompt",
+                    llm_config=llm_config,
+                )
 
 
 if __name__ == "__main__":

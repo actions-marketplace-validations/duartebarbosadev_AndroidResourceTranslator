@@ -87,6 +87,44 @@ class TestReporting(unittest.TestCase):
         self.assertIn("### Language: French", report)
         self.assertIn("| hello | Hello World | Bonjour le monde |", report)
 
+    def test_create_translation_report_distinguishes_duplicate_module_names(self):
+        """Duplicate short names should render as separate module sections."""
+        translation_log = {
+            "/repo/featureA/common": {
+                "_module_name": "common",
+                "es": {
+                    "strings": [
+                        {
+                            "key": "hello",
+                            "source": "Hello",
+                            "translation": "Hola",
+                        }
+                    ],
+                    "plurals": [],
+                },
+            },
+            "/repo/featureB/common": {
+                "_module_name": "common",
+                "fr": {
+                    "strings": [
+                        {
+                            "key": "hello",
+                            "source": "Hello",
+                            "translation": "Bonjour",
+                        }
+                    ],
+                    "plurals": [],
+                },
+            },
+        }
+
+        report = create_translation_report(translation_log)
+
+        self.assertIn("## Module: common (/repo/featureA/common)", report)
+        self.assertIn("## Module: common (/repo/featureB/common)", report)
+        self.assertIn("| hello | Hello | Hola |", report)
+        self.assertIn("| hello | Hello | Bonjour |", report)
+
     @patch("AndroidResourceTranslator.AndroidResourceFile.parse_file")
     def test_check_missing_translations_none_missing(self, mock_parse_file):
         """Test checking for missing translations when all are present."""
@@ -161,6 +199,7 @@ class TestReporting(unittest.TestCase):
         self.assertIn("welcome", log_output)
         self.assertIn("cancel", log_output)
         self.assertIn("items", log_output)
+        self.assertIn("plural groups: items", log_output)
 
         # Verify missing report structure
         self.assertIn("test_module", missing_report)
@@ -169,7 +208,85 @@ class TestReporting(unittest.TestCase):
             sorted(missing_report["test_module"]["es"]["strings"]),
             ["cancel", "welcome"],
         )
-        self.assertIn("items", missing_report["test_module"]["es"]["plurals"])
+        self.assertEqual(
+            missing_report["test_module"]["es"]["plural_groups"], ["items"]
+        )
+        self.assertEqual(missing_report["test_module"]["es"]["plurals"], {})
+
+    @patch("AndroidResourceTranslator.AndroidResourceFile.parse_file")
+    def test_check_missing_translations_does_not_require_source_plural_keys(
+        self, mock_parse_file
+    ):
+        """Plural completeness should not be inferred from source quantity keys."""
+        modules = {}
+        module = AndroidModule("test_module")
+
+        default_res = AndroidResourceFile(Path("dummy/path"), "default")
+        default_res.strings = {}
+        default_res.plurals = {
+            "days": {"one": "%d day", "few": "%d days", "other": "%d days"}
+        }
+
+        pt_res = AndroidResourceFile(Path("dummy/path"), "pt")
+        pt_res.strings = {}
+        pt_res.plurals = {"days": {"other": "%d dias"}}
+
+        module.language_resources["default"] = [default_res]
+        module.language_resources["pt"] = [pt_res]
+        modules["test_module"] = module
+
+        with self.assertLogs(level="INFO") as cm:
+            missing_report = check_missing_translations(modules)
+
+        log_output = "\n".join(cm.output)
+        self.assertIn("All translations are complete", log_output)
+        self.assertEqual(missing_report, {})
+
+    @patch("AndroidResourceTranslator.AndroidResourceFile.parse_file")
+    def test_check_missing_translations_keeps_duplicate_module_names_separate(
+        self, mock_parse_file
+    ):
+        """Missing-report state should be keyed by unique module identifier."""
+        modules = {}
+
+        module_a = AndroidModule("common", identifier="/repo/featureA/common")
+        default_a = AndroidResourceFile(Path("dummy/path"), "default")
+        default_a.strings = {"hello": "Hello"}
+        default_a.plurals = {}
+        es_a = AndroidResourceFile(Path("dummy/path"), "es")
+        es_a.strings = {}
+        es_a.plurals = {}
+        module_a.language_resources["default"] = [default_a]
+        module_a.language_resources["es"] = [es_a]
+        modules[module_a.identifier] = module_a
+
+        module_b = AndroidModule("common", identifier="/repo/featureB/common")
+        default_b = AndroidResourceFile(Path("dummy/path"), "default")
+        default_b.strings = {"bye": "Goodbye"}
+        default_b.plurals = {}
+        fr_b = AndroidResourceFile(Path("dummy/path"), "fr")
+        fr_b.strings = {}
+        fr_b.plurals = {}
+        module_b.language_resources["default"] = [default_b]
+        module_b.language_resources["fr"] = [fr_b]
+        modules[module_b.identifier] = module_b
+
+        missing_report = check_missing_translations(modules)
+
+        self.assertIn("/repo/featureA/common", missing_report)
+        self.assertIn("/repo/featureB/common", missing_report)
+        self.assertEqual(
+            missing_report["/repo/featureA/common"]["_module_name"], "common"
+        )
+        self.assertEqual(
+            missing_report["/repo/featureB/common"]["_module_name"], "common"
+        )
+        self.assertEqual(
+            missing_report["/repo/featureA/common"]["es"]["strings"], ["hello"]
+        )
+        self.assertEqual(
+            missing_report["/repo/featureB/common"]["fr"]["strings"], ["bye"]
+        )
 
 
 if __name__ == "__main__":

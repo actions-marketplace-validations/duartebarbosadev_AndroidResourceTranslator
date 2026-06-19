@@ -3,16 +3,19 @@
 Android Resource Auto-Translator
 
 This script scans Android resource files (strings.xml) for string and plural resources,
-reports missing translations, and can automatically translate missing entries using OpenAI.
+reports missing translations, and can automatically translate missing entries using modern LLM providers.
 """
 
 import logging
 import sys
 import re
 import os
+import json
+import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections import defaultdict
-from typing import Any, Dict, Set, List, Tuple
+from typing import Any, Dict, Set, List, Tuple, Optional, Union
 from lxml import etree
 from language_utils import get_language_name
 from string_utils import escape_special_chars
@@ -27,7 +30,6 @@ from git_utils import (
 
 # Import LLM provider utilities
 from llm_provider import (
-    LLMProvider,
     LLMConfig,
     translate_strings_batch_with_llm,
     translate_plurals_batch_with_llm,
@@ -38,9 +40,10 @@ from llm_provider import (
 # ------------------------------------------------------------------------------
 
 # Maximum number of items to translate in a single batch API call
-MAX_BATCH_SIZE = 100
+MAX_BATCH_SIZE = 10
 # Default number of existing translation pairs/plurals to include as context
 DEFAULT_REFERENCE_CONTEXT_LIMIT = 25
+LOCAL_LLM_PROVIDERS = {"lm_studio", "ollama"}
 
 TRANSLATION_GUIDELINES = """\
 Follow these guidelines carefully.
@@ -113,13 +116,10 @@ After completing translation:
 5. Confirm that the formality level is appropriate and consistent
 6. Verify all rules and guidelines have been followed!
 
-**IMPORTANT Output Requirements:**  
-Return ONLY the final translated text as a single plain line! Preserving only any required formatting from the source.
-Do not include the surrounding Android XML structure (<string> tags, etc.). Only output the translated content!
-Example:
-  Input: "Welcome, <b>%1$s</b>! You have %2$d points."
-  Correct output: "Dobrodošli, <b>%1$s</b>! Imate %2$d poena."
-  INCORRECT output: "<string name="welcome_message">Dobrodošli, <b>%1$s</b>! Imate %2$d poena.</string>"
+**Output Requirements:**
+- Translate only the values. Preserve all JSON keys exactly as provided.
+- Do not include any surrounding Android XML structure (<string> tags, etc.). Only output the translated content.
+- Ensure that the final response strictly adheres to the requested JSON response schema.
 """
 PLURAL_GUIDELINES_ADDITION = """\
 For plural resources, follow these guidelines:
@@ -134,18 +134,85 @@ For plural resources, follow these guidelines:
    (Adjust the text according to correct singular and plural usage in the target language. Use the appropriate plural keys for the target language: zero, one, two, few, many, and other.)
 """
 SYSTEM_MESSAGE_TEMPLATE = """\
-You are a professional translator translating textual UI elements within an Android from English into {target_language}. Follow user guidelines closely.
+You are a professional translator translating textual UI elements within an Android app from English.
+Target Android locale: {target_locale}
+Target language: {target_language}
+Return translations only in the target language and locale above. Using a different language or dialect is invalid.
+Follow user guidelines closely.
 """
-TRANSLATE_FINAL_TEXT = """\
-Translate the following string provided after the dashed line to language: {target_language}
-----------
-"""
+
+
+def _normalize_llm_provider(provider: Optional[str]) -> str:
+    """Normalize provider names from CLI or GitHub Action inputs."""
+    normalized = (provider or "").strip().lower()
+    return normalized or "openrouter"
+
+
+def _provider_api_key_env_var(provider: str) -> str:
+    """Return the provider-specific API key environment variable name."""
+    provider_key = re.sub(r"[^A-Za-z0-9]+", "_", provider).strip("_").upper()
+    return f"{provider_key}_API_KEY"
+
+
+def _first_non_blank(*values: Optional[str]) -> Optional[str]:
+    """Return the first non-empty value after trimming surrounding whitespace."""
+    for value in values:
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _resolve_api_key(
+    provider: str,
+    explicit_api_key: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve API keys from explicit, generic, or provider-specific sources."""
+    provider = _normalize_llm_provider(provider)
+    return _first_non_blank(
+        explicit_api_key,
+        os.environ.get("API_KEY"),
+        os.environ.get(_provider_api_key_env_var(provider)),
+    )
+
+
+def _validate_api_key_for_provider(provider: str, api_key: Optional[str]) -> None:
+    """Ensure remote LLM providers have an API key before translation starts."""
+    provider = _normalize_llm_provider(provider)
+    if provider in LOCAL_LLM_PROVIDERS:
+        return
+    if api_key and api_key.strip():
+        return
+
+    provider_env_var = _provider_api_key_env_var(provider)
+    raise ValueError(
+        f"API key not found for remote LLM provider '{provider}'. "
+        f"Set API_KEY or {provider_env_var}, or pass --api-key."
+    )
+
 
 # ------------------------------------------------------------------------------
 # Logger Setup
 # ------------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
+
+_STANDARD_LOCALE_QUALIFIER_PATTERN = re.compile(
+    r"^[a-z]{2,3}(?:-r(?:[A-Z]{2}|\d{3}))?$"
+)
+_BCP47_LOCALE_QUALIFIER_PATTERN = re.compile(
+    r"^b\+[A-Za-z]{2,3}(?:\+[A-Za-z]{4})?(?:\+(?:[A-Z]{2}|\d{3}))?$"
+)
+
+
+@dataclass
+class UpdatedDefaultResources:
+    """Default resource names whose source text changed and need retranslation."""
+
+    strings: Set[str] = field(default_factory=set)
+    plurals: Set[str] = field(default_factory=set)
+
+    def has_updates(self) -> bool:
+        return bool(self.strings or self.plurals)
 
 
 def _create_secure_fragment_parser() -> etree.XMLParser:
@@ -179,6 +246,50 @@ def _serialize_inner_xml(element) -> str:
             segments.append(child.tail)
 
     return _normalize_inner_xml("".join(segments))
+
+
+def _extract_resource_entries(root) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
+    """Extract translatable string and plural entries from a resources root."""
+    strings: Dict[str, str] = {}
+    plurals: Dict[str, Dict[str, str]] = {}
+
+    for elem in root:
+        translatable = elem.attrib.get("translatable", "true").lower()
+        if translatable == "false":
+            continue
+
+        if elem.tag == "string":
+            name = elem.attrib.get("name")
+            if name:
+                strings[name] = _serialize_inner_xml(elem)
+        elif elem.tag == "plurals":
+            name = elem.attrib.get("name")
+            if name:
+                quantities: Dict[str, str] = {}
+                for item in elem.findall("item"):
+                    quantity = item.attrib.get("quantity")
+                    if quantity:
+                        quantities[quantity] = _serialize_inner_xml(item)
+                plurals[name] = quantities
+
+    return strings, plurals
+
+
+def _parse_resource_xml_content(
+    content: bytes, path_label: str
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
+    """Parse strings.xml content loaded from a source other than the filesystem."""
+    try:
+        parser = etree.XMLParser(
+            remove_blank_text=False,
+            resolve_entities=False,
+            no_network=True,
+        )
+        root = etree.fromstring(content, parser=parser)
+        return _extract_resource_entries(root)
+    except etree.XMLSyntaxError as pe:
+        logger.warning(f"XML parse error in previous version of {path_label}: {pe}")
+        return {}, {}
 
 
 def _set_element_inner_xml(element, content: str) -> None:
@@ -234,6 +345,8 @@ def configure_logging(trace: bool) -> None:
 
     # Suppress noisy debug logs from HTTP client/SDK libraries unless they escalate.
     noisy_loggers = [
+        "LiteLLM",
+        "litellm",
         "openai",
         "openai._base_client",
         "openai._http_client",
@@ -269,26 +382,7 @@ class AndroidResourceFile:
             parser = etree.XMLParser(remove_blank_text=False)
             tree = etree.parse(str(self.path), parser)
             root = tree.getroot()
-            for elem in root:
-                translatable = elem.attrib.get("translatable", "true").lower()
-                if translatable == "false":
-                    continue
-
-                if elem.tag == "string":
-                    name = elem.attrib.get("name")
-                    if name:
-                        full_text = _serialize_inner_xml(elem)
-                        self.strings[name] = full_text
-                elif elem.tag == "plurals":
-                    name = elem.attrib.get("name")
-                    if name:
-                        quantities: Dict[str, str] = {}
-                        for item in elem.findall("item"):
-                            quantity = item.attrib.get("quantity")
-                            if quantity:
-                                full_text = _serialize_inner_xml(item)
-                                quantities[quantity] = full_text
-                        self.plurals[name] = quantities
+            self.strings, self.plurals = _extract_resource_entries(root)
             logger.debug(
                 f"Parsed {len(self.strings)} strings and {len(self.plurals)} plurals from {self.path}"
             )
@@ -347,14 +441,20 @@ def detect_language_from_path(file_path: Path) -> str:
       - "values-zh-rCN"    -> "zh-rCN" (Chinese Simplified)
       - "values-b+sr+Latn" -> "b+sr+Latn" (Serbian in Latin script)
 
-    The function tries to match the standard pattern first (values-XX),
-    and falls back to a simpler replacement if the pattern doesn't match.
+    The function accepts only Android locale qualifiers in standard form
+    (e.g., values-es, values-pt-rPT) or BCP 47 form (e.g., values-b+sr+Latn).
+    Non-locale configuration qualifiers such as values-night or values-v31 are
+    rejected.
 
     Args:
         file_path: Path object pointing to a resource file
 
     Returns:
         String representing the language code, or "default" for the base language
+
+    Raises:
+        ValueError: If the parent directory is not "values" or a valid locale
+                    resource directory.
     """
     values_dir = file_path.parent.name
 
@@ -371,6 +471,16 @@ def detect_language_from_path(file_path: Path) -> str:
         )
 
     language = match.group(1)
+    if not (
+        _STANDARD_LOCALE_QUALIFIER_PATTERN.fullmatch(language)
+        or _BCP47_LOCALE_QUALIFIER_PATTERN.fullmatch(language)
+    ):
+        raise ValueError(
+            f"Invalid Android locale qualifier: '{values_dir}'. "
+            "Expected a locale folder such as 'values-es', 'values-pt-rPT', "
+            "or 'values-b+sr+Latn'."
+        )
+
     logger.debug(f"Detected language '{language}' from {values_dir}")
     return language
 
@@ -414,9 +524,11 @@ def find_resource_files(
     # 2. Otherwise, use patterns from .gitignore files with proper precedence
     if ignore_folders:
         logger.info(f"Using explicit ignore folders: {', '.join(ignore_folders)}")
+        ignored_folder_names = set(ignore_folders)
         gitignore_patterns = []
         all_gitignores = {}
     else:
+        ignored_folder_names = set()
         # Find all .gitignore files in the directory hierarchy
         all_gitignores = find_all_gitignores(resources_path)
         if all_gitignores:
@@ -438,7 +550,7 @@ def find_resource_files(
     for xml_file_path in resources_dir.rglob("strings.xml"):
         # Skip files in ignored directories
         if ignore_folders and any(
-            ignored in str(xml_file_path.parts) for ignored in ignore_folders
+            path_part in ignored_folder_names for path_part in xml_file_path.parts
         ):
             logger.debug(f"Skipping {xml_file_path} (matched ignore_folders)")
             continue
@@ -460,7 +572,15 @@ def find_resource_files(
             continue
 
         # Detect which language this resource file is for
-        language = detect_language_from_path(xml_file_path)
+        try:
+            language = detect_language_from_path(xml_file_path)
+        except ValueError:
+            logger.debug(
+                "Skipping %s because '%s' is not a locale resource directory",
+                xml_file_path,
+                xml_file_path.parent.name,
+            )
+            continue
 
         try:
             # Identify the module based on the project structure
@@ -488,6 +608,224 @@ def find_resource_files(
         modules[module_key].add_resource(language, resource_file)
 
     return modules
+
+
+def _run_git_command(
+    args: List[str], cwd: Path, text: bool = True
+) -> Optional[Union[str, bytes]]:
+    """Run a git command and return stdout, or None when git data is unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=text,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    return result.stdout.strip() if text else result.stdout
+
+
+def _git_commit_exists(repo_root: Path, ref: str) -> bool:
+    return _run_git_command(["cat-file", "-e", f"{ref}^{{commit}}"], repo_root) == ""
+
+
+def _read_github_event_before_sha() -> Optional[str]:
+    event = _read_github_event()
+    if not event:
+        return None
+
+    before = event.get("before")
+    if isinstance(before, str) and before and set(before) != {"0"}:
+        return before
+
+    pull_request = event.get("pull_request")
+    if isinstance(pull_request, dict):
+        base = pull_request.get("base")
+        if isinstance(base, dict):
+            sha = base.get("sha")
+            if isinstance(sha, str) and sha:
+                return sha
+
+    return None
+
+
+def _read_github_event() -> Optional[Dict[str, Any]]:
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if not event_path:
+        return None
+
+    try:
+        with open(event_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _normalize_github_event_path(path: str) -> str:
+    """Normalize GitHub event paths without stripping leading-dot directories."""
+    return path[2:] if path.startswith("./") else path
+
+
+def _read_github_event_modified_paths() -> Set[str]:
+    event = _read_github_event()
+    if not event:
+        return set()
+
+    modified_paths: Set[str] = set()
+    commits = event.get("commits", [])
+    if isinstance(commits, list):
+        for commit in commits:
+            if not isinstance(commit, dict):
+                continue
+            modified = commit.get("modified", [])
+            if isinstance(modified, list):
+                modified_paths.update(
+                    _normalize_github_event_path(path)
+                    for path in modified
+                    if isinstance(path, str)
+                )
+
+    head_commit = event.get("head_commit")
+    if isinstance(head_commit, dict):
+        modified = head_commit.get("modified", [])
+        if isinstance(modified, list):
+            modified_paths.update(
+                _normalize_github_event_path(path)
+                for path in modified
+                if isinstance(path, str)
+            )
+
+    return modified_paths
+
+
+def _resolve_previous_commit_ref(repo_root: Path) -> Optional[str]:
+    """
+    Resolve a previous commit for GitHub Action runs.
+
+    Local runs only use uncommitted file changes, avoiding repeated retranslation of
+    whatever happened to change in the most recent commit.
+    """
+    if os.environ.get("GITHUB_ACTIONS", "false").lower() != "true":
+        return None
+
+    event_before = _read_github_event_before_sha()
+    if event_before and _git_commit_exists(repo_root, event_before):
+        return event_before
+
+    if _git_commit_exists(repo_root, "HEAD^"):
+        return "HEAD^"
+
+    return None
+
+
+def _path_has_worktree_changes(repo_root: Path, rel_path: str) -> bool:
+    status = _run_git_command(["status", "--porcelain", "--", rel_path], repo_root)
+    return bool(status)
+
+
+def _read_git_file(repo_root: Path, ref: str, rel_path: str) -> Optional[bytes]:
+    output = _run_git_command(["show", f"{ref}:{rel_path}"], repo_root, text=False)
+    return output if isinstance(output, bytes) else None
+
+
+def _find_updated_default_resource_entries(
+    previous_strings: Dict[str, str],
+    previous_plurals: Dict[str, Dict[str, str]],
+    current_resource: AndroidResourceFile,
+) -> UpdatedDefaultResources:
+    updated = UpdatedDefaultResources()
+
+    for key, current_value in current_resource.strings.items():
+        if key in previous_strings and previous_strings[key] != current_value:
+            updated.strings.add(key)
+
+    for plural_name, current_quantities in current_resource.plurals.items():
+        if (
+            plural_name in previous_plurals
+            and previous_plurals[plural_name] != current_quantities
+        ):
+            updated.plurals.add(plural_name)
+
+    return updated
+
+
+def detect_updated_default_resources(
+    modules: Dict[str, AndroidModule],
+) -> Dict[str, UpdatedDefaultResources]:
+    """
+    Detect default strings/plurals whose source text changed since the prior version.
+
+    This lets existing localized entries be refreshed instead of only filling missing
+    keys. Local runs compare uncommitted changes against HEAD; GitHub Action runs
+    compare the checked-out commit against the event's previous commit when present.
+    """
+    repo_root_output = _run_git_command(["rev-parse", "--show-toplevel"], Path.cwd())
+    if not isinstance(repo_root_output, str):
+        return {}
+
+    repo_root = Path(repo_root_output)
+    previous_commit_ref = _resolve_previous_commit_ref(repo_root)
+    github_modified_paths = _read_github_event_modified_paths()
+    updated_by_module: Dict[str, UpdatedDefaultResources] = {}
+
+    for module in modules.values():
+        for resource in module.language_resources.get("default", []):
+            try:
+                rel_path = resource.path.resolve().relative_to(repo_root).as_posix()
+            except ValueError:
+                continue
+
+            previous_ref = None
+            if _path_has_worktree_changes(repo_root, rel_path):
+                previous_ref = "HEAD"
+            elif previous_commit_ref:
+                previous_ref = previous_commit_ref
+
+            updated = None
+            if previous_ref:
+                previous_content = _read_git_file(repo_root, previous_ref, rel_path)
+                if previous_content is None:
+                    if rel_path not in github_modified_paths:
+                        continue
+                else:
+                    previous_strings, previous_plurals = _parse_resource_xml_content(
+                        previous_content, rel_path
+                    )
+                    updated = _find_updated_default_resource_entries(
+                        previous_strings,
+                        previous_plurals,
+                        resource,
+                    )
+
+            if updated is None:
+                if rel_path not in github_modified_paths:
+                    continue
+                updated = UpdatedDefaultResources(
+                    strings=set(resource.strings.keys()),
+                    plurals=set(resource.plurals.keys()),
+                )
+
+            if not updated.has_updates():
+                continue
+
+            module_updated = updated_by_module.setdefault(
+                module.identifier, UpdatedDefaultResources()
+            )
+            module_updated.strings.update(updated.strings)
+            module_updated.plurals.update(updated.plurals)
+
+    for module_key, updated in updated_by_module.items():
+        logger.info(
+            "Detected updated default resources for module '%s': strings=%s, plurals=%s",
+            module_key,
+            ", ".join(sorted(updated.strings)) or "none",
+            ", ".join(sorted(updated.plurals)) or "none",
+        )
+
+    return updated_by_module
 
 
 def update_xml_file(resource: AndroidResourceFile) -> None:
@@ -790,7 +1128,9 @@ def _translate_missing_strings(
     # Handle empty strings separately
     for key in sorted(missing_strings):
         if module_default_strings[key].strip() == "":
-            res.strings[key] = ""
+            if res.strings.get(key) != "":
+                res.strings[key] = ""
+                res.modified = True
 
     if not non_empty_strings:
         return results
@@ -799,12 +1139,13 @@ def _translate_missing_strings(
     language_name = get_language_name(lang)
 
     # Build the base prompt (without specific strings)
-    base_prompt = TRANSLATION_GUIDELINES + TRANSLATE_FINAL_TEXT.format(
-        target_language=language_name
-    )
+    base_prompt = TRANSLATION_GUIDELINES
 
     # Configure the system message
-    system_message = SYSTEM_MESSAGE_TEMPLATE.format(target_language=language_name)
+    system_message = SYSTEM_MESSAGE_TEMPLATE.format(
+        target_locale=lang,
+        target_language=language_name,
+    )
     if project_context:
         system_message += f"\nProject context: {project_context}"
 
@@ -836,6 +1177,8 @@ def _translate_missing_strings(
             "system_message": system_message,
             "user_prompt": base_prompt,
             "llm_config": llm_config,
+            "target_language": language_name,
+            "target_locale": lang,
         }
 
         if include_reference_context and reference_examples:
@@ -885,6 +1228,7 @@ def _translate_missing_plurals(
     project_context: str,
     include_reference_context: bool,
     reference_context_limit: int,
+    replace_existing_plurals: Optional[Set[str]] = None,
 ) -> List[Dict]:
     """
     Helper function to translate missing plurals for a resource file.
@@ -908,18 +1252,19 @@ def _translate_missing_plurals(
     if not missing_plurals:
         return results
 
+    replace_existing_plurals = replace_existing_plurals or set()
+
     # Get the language name for prompts
     language_name = get_language_name(lang)
 
     # Build the base prompt (without specific plurals)
-    base_prompt = (
-        TRANSLATION_GUIDELINES
-        + PLURAL_GUIDELINES_ADDITION
-        + TRANSLATE_FINAL_TEXT.format(target_language=language_name)
-    )
+    base_prompt = TRANSLATION_GUIDELINES + PLURAL_GUIDELINES_ADDITION
 
     # Configure the system message
-    system_message = SYSTEM_MESSAGE_TEMPLATE.format(target_language=language_name)
+    system_message = SYSTEM_MESSAGE_TEMPLATE.format(
+        target_locale=lang,
+        target_language=language_name,
+    )
     if project_context:
         system_message += f"\nProject context: {project_context}"
 
@@ -951,6 +1296,8 @@ def _translate_missing_plurals(
             "system_message": system_message,
             "user_prompt": base_prompt,
             "llm_config": llm_config,
+            "target_language": language_name,
+            "target_locale": lang,
         }
 
         if include_reference_context and reference_examples:
@@ -972,10 +1319,13 @@ def _translate_missing_plurals(
                         translated_text, reference_text=reference_text
                     )
 
-                # Merge with existing translations, preserving already translated values
-                merged = current_map.copy()
-                merged.update(sanitized_plural)
-                res.plurals[plural_name] = merged
+                if plural_name in replace_existing_plurals:
+                    res.plurals[plural_name] = sanitized_plural
+                else:
+                    # Merge with existing translations, preserving already translated values
+                    merged = current_map.copy()
+                    merged.update(sanitized_plural)
+                    res.plurals[plural_name] = merged
                 res.modified = True
 
                 logger.info(
@@ -1028,8 +1378,10 @@ def _generate_translation_summary(translation_log: dict, total_translated: int) 
         return
 
     translated_info = {}
-    for module_name, lang_details in translation_log.items():
+    for lang_details in translation_log.values():
         for lang, details in lang_details.items():
+            if lang == "_module_name":
+                continue
             entry = translated_info.setdefault(
                 lang, {"strings": set(), "plurals": set()}
             )
@@ -1062,15 +1414,32 @@ def _generate_translation_summary(translation_log: dict, total_translated: int) 
         logger.info(" ".join(msg_parts))
 
 
+def _duplicate_module_names(modules: Dict[str, AndroidModule]) -> Set[str]:
+    """Return module short names that appear more than once."""
+    name_counts: Dict[str, int] = defaultdict(int)
+    for module in modules.values():
+        name_counts[module.name] += 1
+    return {name for name, count in name_counts.items() if count > 1}
+
+
+def _module_report_key(module: AndroidModule, duplicate_names: Set[str]) -> str:
+    """Use short names by default, falling back to unique identifiers for duplicates."""
+    if module.name in duplicate_names:
+        return module.identifier
+    return module.name
+
+
 def auto_translate_resources(
     modules: Dict[str, AndroidModule],
     llm_config: LLMConfig,
     project_context: str,
     include_reference_context: bool = True,
     reference_context_limit: int = DEFAULT_REFERENCE_CONTEXT_LIMIT,
+    updated_default_resources: Dict[str, UpdatedDefaultResources] = None,
 ) -> dict:
     """
-    For each non-default language resource, auto-translate missing strings and plural items.
+    For each non-default language resource, auto-translate missing strings/plurals
+    and refresh entries whose default source text changed.
     Returns a translation_log dictionary with details of the translations performed.
 
     Args:
@@ -1080,6 +1449,8 @@ def auto_translate_resources(
     """
     translation_log = {}
     total_translated = 0
+    duplicate_names = _duplicate_module_names(modules)
+    updated_default_resources = updated_default_resources or {}
 
     for module in modules.values():
         if "default" not in module.language_resources:
@@ -1093,13 +1464,20 @@ def auto_translate_resources(
             module
         )
 
+        module_report_key = _module_report_key(module, duplicate_names)
+        module_updates = updated_default_resources.get(
+            module.identifier, UpdatedDefaultResources()
+        )
         # Process each non-default language
         for lang, resources in module.language_resources.items():
             if lang == "default":
                 continue
 
+            module_log = translation_log.setdefault(
+                module_report_key, {"_module_name": module.name}
+            )
             # Initialize translation log for this language
-            translation_log.setdefault(module.name, {})[lang] = {
+            module_log[lang] = {
                 "strings": [],
                 "plurals": [],
             }
@@ -1109,29 +1487,46 @@ def auto_translate_resources(
                 missing_strings = set(module_default_strings.keys()) - set(
                     res.strings.keys()
                 )
+                updated_strings = {
+                    key
+                    for key in module_updates.strings
+                    if key in module_default_strings and key in res.strings
+                }
+                strings_to_translate = missing_strings | updated_strings
 
                 # Find missing plurals
                 missing_plurals = {}
                 for plural_name, default_map in module_default_plurals.items():
                     current_map = res.plurals.get(plural_name, {})
-                    if not current_map or set(current_map.keys()) != set(
-                        default_map.keys()
-                    ):
+
+                    # Treat an existing plural resource as complete regardless of the
+                    # specific quantity keys it contains. Plural categories are
+                    # language-specific, so the default locale's keys are not a safe
+                    # completeness contract for every target language.
+                    if not current_map:
+                        missing_plurals[plural_name] = default_map
+                    elif plural_name in module_updates.plurals:
                         missing_plurals[plural_name] = default_map
 
+                updated_plurals = {
+                    plural_name
+                    for plural_name in module_updates.plurals
+                    if plural_name in missing_plurals and plural_name in res.plurals
+                }
+
                 # Skip if nothing to translate
-                if not missing_strings and not missing_plurals:
+                if not strings_to_translate and not missing_plurals:
                     continue
 
                 logger.info(
-                    f"Auto-translating missing resources for module '{module.name}', language '{lang}'"
+                    f"Auto-translating resources for module '{module.name}', language '{lang}'"
                 )
 
                 # Translate missing strings
-                if missing_strings:
+                if strings_to_translate:
                     string_results = _translate_missing_strings(
                         res,
-                        missing_strings,
+                        strings_to_translate,
                         module_default_strings,
                         lang,
                         llm_config,
@@ -1139,7 +1534,7 @@ def auto_translate_resources(
                         include_reference_context,
                         reference_context_limit,
                     )
-                    translation_log[module.name][lang]["strings"].extend(string_results)
+                    module_log[lang]["strings"].extend(string_results)
                     total_translated += len(string_results)
 
                 # Translate missing plurals
@@ -1153,8 +1548,9 @@ def auto_translate_resources(
                         project_context,
                         include_reference_context,
                         reference_context_limit,
+                        replace_existing_plurals=updated_plurals,
                     )
-                    translation_log[module.name][lang]["plurals"].extend(plural_results)
+                    module_log[lang]["plurals"].extend(plural_results)
                     total_translated += sum(
                         len(p["translations"]) for p in plural_results
                     )
@@ -1228,14 +1624,14 @@ def _collect_language_translations(
 
 
 def _format_missing_translations(
-    missing_strings: Set[str], missing_plurals: Dict[str, Set[str]]
+    missing_strings: Set[str], missing_plural_groups: Set[str]
 ) -> str:
     """
     Format missing translations for logging.
 
     Args:
         missing_strings: Set of missing string keys
-        missing_plurals: Dict of missing plural names and quantities
+        missing_plural_groups: Set of missing plural resource names
 
     Returns:
         Formatted string describing what's missing
@@ -1245,11 +1641,8 @@ def _format_missing_translations(
     if missing_strings:
         parts.append(f"strings: {', '.join(sorted(missing_strings))}")
 
-    if missing_plurals:
-        plurals_part = ", ".join(
-            [f"{k}({', '.join(sorted(v))})" for k, v in missing_plurals.items()]
-        )
-        parts.append(f"plurals: {plurals_part}")
+    if missing_plural_groups:
+        parts.append(f"plural groups: {', '.join(sorted(missing_plural_groups))}")
 
     return " | ".join(parts)
 
@@ -1257,7 +1650,10 @@ def _format_missing_translations(
 def check_missing_translations(modules: Dict[str, AndroidModule]) -> dict:
     """
     For each module, compare non-default language resources against the union of keys
-    in the default language. Checks for missing <string> keys and missing plural quantities.
+    in the default language. Checks for missing <string> keys and missing plural
+    resource groups. Plural quantity keys are language-specific, so existing
+    target plural groups are not flagged for having different quantities from
+    the default locale.
 
     Args:
         modules: Dictionary of module identifiers to AndroidModule objects
@@ -1268,6 +1664,7 @@ def check_missing_translations(modules: Dict[str, AndroidModule]) -> dict:
     logger.info("Missing Translations Report")
     missing_count = 0
     missing_report = {}
+    duplicate_names = _duplicate_module_names(modules)
 
     for module in modules.values():
         module_has_missing = False
@@ -1282,6 +1679,7 @@ def check_missing_translations(modules: Dict[str, AndroidModule]) -> dict:
             module
         )
 
+        module_report_key = _module_report_key(module, duplicate_names)
         # Check each non-default language
         for lang, resources in sorted(module.language_resources.items()):
             if lang == "default":
@@ -1294,34 +1692,31 @@ def check_missing_translations(modules: Dict[str, AndroidModule]) -> dict:
 
             # Find what's missing
             missing_strings = default_strings - lang_strings
-            missing_plurals: Dict[str, Set[str]] = {}
+            missing_plural_groups: Set[str] = set()
 
-            for plural_name, def_qty in default_plural_quantities.items():
+            for plural_name in default_plural_quantities:
                 current_qty = lang_plural_quantities.get(plural_name, set())
-                diff = def_qty - current_qty
-                if diff:
-                    missing_plurals[plural_name] = diff
+                if not current_qty:
+                    missing_plural_groups.add(plural_name)
 
             # Log and report if anything is missing
-            if missing_strings or missing_plurals:
+            if missing_strings or missing_plural_groups:
                 missing_count += 1
                 module_has_missing = True
 
                 # Format for logging
                 missing_description = _format_missing_translations(
-                    missing_strings, missing_plurals
+                    missing_strings, missing_plural_groups
                 )
                 module_log_lines.append(f"  [{lang}]: missing {missing_description}")
 
                 # Add to the report dictionary
-                if module.name not in missing_report:
-                    missing_report[module.name] = {}
-                missing_report[module.name][lang] = {
+                if module_report_key not in missing_report:
+                    missing_report[module_report_key] = {"_module_name": module.name}
+                missing_report[module_report_key][lang] = {
                     "strings": list(missing_strings),
-                    "plurals": {
-                        name: list(quantities)
-                        for name, quantities in missing_plurals.items()
-                    },
+                    "plural_groups": sorted(missing_plural_groups),
+                    "plurals": {},
                 }
 
         # Log for this module
@@ -1349,12 +1744,20 @@ def create_translation_report(translation_log):
     report = "# Translation Report\n\n"
     has_translations = False
 
-    for module, languages in translation_log.items():
+    for module_identifier, languages in translation_log.items():
         module_has_translations = False
-        module_report = f"## Module: {module}\n\n"
+        module_name = languages.get("_module_name", module_identifier)
+        if module_name == module_identifier:
+            module_heading = module_name
+        else:
+            module_heading = f"{module_name} ({module_identifier})"
+
+        module_report = f"## Module: {module_heading}\n\n"
         languages_report = ""
 
         for lang, details in languages.items():
+            if lang == "_module_name":
+                continue
             has_string_translations = bool(details.get("strings"))
             has_plural_translations = bool(details.get("plurals"))
 
@@ -1408,6 +1811,7 @@ def main() -> None:
     Parses command-line arguments or environment variables, finds resource files,
     checks for missing translations, and auto-translates them.
     """
+    global MAX_BATCH_SIZE
     is_github = os.environ.get("GITHUB_ACTIONS", "false").lower() == "true"
     if is_github:
         resources_paths_input = os.environ.get("INPUT_RESOURCES_PATHS")
@@ -1420,18 +1824,13 @@ def main() -> None:
         log_trace = os.environ.get("INPUT_LOG_TRACE", "false").lower() == "true"
 
         # LLM Provider configuration
-        llm_provider = os.environ.get("INPUT_LLM_PROVIDER", "openrouter").lower()
-        model = os.environ.get("INPUT_MODEL") or os.environ.get(
-            "INPUT_OPENAI_MODEL", "google/gemini-2.5-flash"
-        )  # Support legacy param
+        llm_provider = _normalize_llm_provider(
+            os.environ.get("INPUT_LLM_PROVIDER", "openrouter")
+        )
+        model = os.environ.get("INPUT_MODEL", "google/gemini-2.5-flash")
 
-        # API Keys - check provider-specific key first, then fall back to OpenAI key for compatibility
-        if llm_provider == "openrouter":
-            api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get(
-                "OPENAI_API_KEY"
-            )
-        else:
-            api_key = os.environ.get("OPENAI_API_KEY")
+        # API Keys
+        api_key = _resolve_api_key(provider=llm_provider)
 
         # OpenRouter-specific settings
         openrouter_site_url = os.environ.get(
@@ -1462,6 +1861,18 @@ def main() -> None:
                 f"{DEFAULT_REFERENCE_CONTEXT_LIMIT}"
             )
             reference_context_limit = DEFAULT_REFERENCE_CONTEXT_LIMIT
+
+        batch_size_raw = os.environ.get("INPUT_BATCH_SIZE", "10")
+        try:
+            MAX_BATCH_SIZE = int(batch_size_raw)
+            if MAX_BATCH_SIZE <= 0:
+                raise ValueError()
+        except ValueError:
+            print(
+                f"Invalid INPUT_BATCH_SIZE value ('{batch_size_raw}'); "
+                f"falling back to 10"
+            )
+            MAX_BATCH_SIZE = 10
 
         ignore_folders_input = os.environ.get("INPUT_IGNORE_FOLDERS", "")
         ignore_folders = (
@@ -1501,34 +1912,18 @@ def main() -> None:
         # LLM Provider arguments
         parser.add_argument(
             "--llm-provider",
-            choices=["openai", "openrouter"],
             default="openrouter",
-            help="LLM provider to use (default: openrouter)",
+            help="LLM provider to use (e.g. openrouter, openai, gemini, anthropic, ollama, lm_studio)",
+        )
+        parser.add_argument(
+            "--api-key",
+            default=None,
+            help="API key for the chosen LLM provider (optional; can also be set via standard environment variables)",
         )
         parser.add_argument(
             "--model",
             default="google/gemini-2.5-flash",
             help="Model to use for translation (default: google/gemini-2.5-flash)",
-        )
-        parser.add_argument(
-            "--openai-model",
-            dest="model_legacy",
-            default=None,
-            help="(Deprecated: use --model) OpenAI model to use",
-        )
-
-        # API Key arguments
-        parser.add_argument(
-            "--openai-api-key",
-            dest="openai_api_key",
-            default=None,
-            help="OpenAI API key",
-        )
-        parser.add_argument(
-            "--openrouter-api-key",
-            dest="openrouter_api_key",
-            default=None,
-            help="OpenRouter API key",
         )
 
         # OpenRouter-specific arguments
@@ -1586,6 +1981,12 @@ def main() -> None:
             default=DEFAULT_REFERENCE_CONTEXT_LIMIT,
             help="Maximum number of existing translations to include as context (0 disables context).",
         )
+        parser.add_argument(
+            "--batch-size",
+            type=int,
+            default=10,
+            help="Maximum number of items to translate in a single batch API call (default: 10)",
+        )
 
         args = parser.parse_args()
 
@@ -1594,14 +1995,19 @@ def main() -> None:
         log_trace = args.log_trace
 
         # LLM Provider configuration
-        llm_provider = args.llm_provider
-        model = args.model_legacy or args.model  # Support legacy --openai-model
+        llm_provider = _normalize_llm_provider(args.llm_provider)
+        model = args.model
 
-        # API Keys - determine based on provider (strict matching)
-        if llm_provider == "openrouter":
-            api_key = args.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
-        else:
-            api_key = args.openai_api_key or os.environ.get("OPENAI_API_KEY")
+        # API Keys
+        api_key = _resolve_api_key(
+            provider=llm_provider,
+            explicit_api_key=args.api_key,
+        )
+
+        MAX_BATCH_SIZE = args.batch_size
+        if MAX_BATCH_SIZE <= 0:
+            print(f"Invalid batch size {MAX_BATCH_SIZE}; falling back to 10")
+            MAX_BATCH_SIZE = 10
 
         openrouter_site_url = args.openrouter_site_url
         openrouter_site_name = args.openrouter_site_name
@@ -1648,36 +2054,12 @@ def main() -> None:
 
     configure_logging(log_trace)
 
-    # Early validation: Check API key if not in dry-run mode
-    if not dry_run and not api_key:
-        env_var_name = (
-            "OPENROUTER_API_KEY" if llm_provider == "openrouter" else "OPENAI_API_KEY"
-        )
-        print("\n========================================")
-        print("ERROR: API key not found!")
-        print("========================================")
-        print(
-            "Translation is enabled (not in dry-run mode) but no API key was provided."
-        )
-        print("\nTo fix this:")
-        print(
-            f"\n1. For GitHub Actions, add {env_var_name} to your repository secrets:"
-        )
-        print("   - Go to Settings > Secrets and variables > Actions")
-        print(f"   - Add a new secret named: {env_var_name}")
-        print("   - Pass it via env in your workflow:")
-        print("     env:")
-        print(f"       {env_var_name}: ${{{{ secrets.{env_var_name} }}}}")
-        print("\n2. For local execution, set the environment variable:")
-        print(f"   export {env_var_name}=your_key_here")
-        print("\n3. Or pass it as a command-line argument:")
-        print(f"   --{llm_provider}-api-key YOUR_KEY")
-        if llm_provider == "openrouter":
-            print("\nGet your API key at: https://openrouter.ai/keys")
-        else:
-            print("\nGet your API key at: https://platform.openai.com/api-keys")
-        print("========================================\n")
-        sys.exit(1)
+    if not dry_run:
+        try:
+            _validate_api_key_for_provider(llm_provider, api_key)
+        except ValueError as e:
+            logger.error(str(e))
+            sys.exit(1)
 
     if not resources_paths:
         print("Error: 'resources_paths' input not provided.")
@@ -1717,13 +2099,15 @@ def main() -> None:
         for module in sorted(merged_modules.values(), key=lambda m: m.name):
             module.print_resources()
 
+    updated_default_resources = detect_updated_default_resources(merged_modules)
+
     translation_log = {}
     # If not in dry-run mode, run the translation process.
     if not dry_run:
         # Create LLM configuration
         try:
             llm_config = LLMConfig(
-                provider=LLMProvider(llm_provider),
+                provider=llm_provider,
                 api_key=api_key,
                 model=model,
                 site_url=openrouter_site_url if llm_provider == "openrouter" else None,
@@ -1745,6 +2129,7 @@ def main() -> None:
             project_context,
             include_reference_context=should_include_reference_context,
             reference_context_limit=reference_context_limit,
+            updated_default_resources=updated_default_resources,
         )
 
     # Whether or not auto-translation was performed, still check for missing translations.
